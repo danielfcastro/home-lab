@@ -1,7 +1,17 @@
 #!/bin/sh
 # Install Jellyseerr on Alpine Linux (LXC) - estilo Servarr
 
-set -e
+set -eu
+
+# 👉 helper de logging (tools/logging.sh)
+# Conteúdo esperado do logging.sh:
+#   #!/bin/sh
+#   set -eu
+#   setup_logging() { ... }
+. "$(dirname "$0")/logging.sh"
+
+SERVICE_NAME="jellyseerr"
+setup_logging "$SERVICE_NAME"
 
 APP_NAME="Jellyseerr"
 APP_USER="jellyseerr"
@@ -15,6 +25,11 @@ REPO_URL="https://github.com/Fallenbagel/jellyseerr.git"
 APP_PORT="5055"
 
 echo "==> $APP_NAME - Instalador para Alpine Linux"
+
+if [ ! -f /etc/alpine-release ]; then
+  echo "Este instalador é apenas para Alpine Linux."
+  exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "Este script precisa ser executado como root."
@@ -37,7 +52,9 @@ apk add --no-cache \
   npm \
   python3 \
   build-base \
-  bash
+  bash \
+  openrc \
+  logrotate
 
 echo "==> Instalando pnpm globalmente..."
 npm install -g pnpm
@@ -94,7 +111,7 @@ env HOME="/root" \
 echo "==> Criando wrapper $WRAPPER..."
 cat >"$WRAPPER" <<'EOF'
 #!/bin/sh
-# Wrapper para iniciar o Jellyseerr com tini + su-exec no Alpine
+# Wrapper para iniciar o Jellyseerr com tini no Alpine
 
 APP_USER="jellyseerr"
 APP_GROUP="jellyseerr"
@@ -107,9 +124,8 @@ export NODE_ENV=production
 export HOME="${DATA_DIR}"
 export PNPM_IGNORE_NODE_ENGINE=1
 
-exec /sbin/tini -g -- \
-  su-exec "${APP_USER}:${APP_GROUP}" \
-  node dist/index.js
+# OpenRC já executa como APP_USER, então não precisamos de su-exec aqui.
+exec /sbin/tini -g -- node dist/index.js
 EOF
 
 chmod +x "$WRAPPER"
@@ -122,16 +138,23 @@ name="Jellyseerr"
 description="Jellyseerr - Media request manager (Jellyfin/Emby/Plex)"
 
 command="/usr/local/bin/jellyseerr-run"
-command_user="root:root"
+command_user="jellyseerr:jellyseerr"
 command_background="yes"
-pidfile="/run/jellyseerr.pid"
+pidfile="/run/$RC_SVCNAME.pid"
 
-output_log="/var/log/jellyseerr/jellyseerr.log"
-error_log="/var/log/jellyseerr/jellyseerr.err"
+# Diretório e arquivos de log em /var/log/jellyseerr
+log_dir="/var/log/$RC_SVCNAME"
+output_log="${output_log:-$log_dir/output.log}"
+error_log="${error_log:-$log_dir/error.log}"
 
 depend() {
     need net
     use dns logger
+}
+
+start_pre() {
+    # Garante que o diretório de log exista e seja do usuário correto
+    checkpath --directory --owner jellyseerr:jellyseerr "$log_dir"
 }
 EOF
 
@@ -141,12 +164,33 @@ echo "==> Garantindo diretórios de log..."
 mkdir -p "$LOG_DIR"
 chown "$APP_USER:$APP_GROUP" "$LOG_DIR"
 
+# Garante estrutura básica do OpenRC em LXC
+if [ ! -d /run/openrc ]; then
+  echo "==> Inicializando OpenRC em /run/openrc..."
+  mkdir -p /run/openrc
+  touch /run/openrc/softlevel
+fi
+
 echo "==> Adicionando serviço ao boot (runlevel default)..."
 rc-update add jellyseerr default || true
 
 echo "==> Parando instância antiga (se existir) e limpando pidfile..."
 rc-service jellyseerr stop >/dev/null 2>&1 || true
 rm -f /run/jellyseerr.pid 2>/dev/null || true
+
+### LOGROTATE
+echo "==> Configurando logrotate para /var/log/jellyseerr..."
+cat >/etc/logrotate.d/jellyseerr <<'EOF'
+/var/log/jellyseerr/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0640 jellyseerr jellyseerr
+    sharedscripts
+}
+EOF
 
 echo "==> Iniciando serviço Jellyseerr..."
 rc-service jellyseerr start || true
