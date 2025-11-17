@@ -24,6 +24,7 @@ DATA_DIR="/var/lib/bazarr"
 APP_USER="bazarr"
 APP_GROUP="media"
 APP_PORT="6767"   # porta padrão do Bazarr
+LOG_DIR="/var/log/bazarr"
 
 ### 1. Checks básicos
 
@@ -57,8 +58,8 @@ fi
 
 # limpa instalação anterior
 rm -rf "$INSTALL_DIR"
-mkdir -p "$INSTALL_DIR" "$DATA_DIR"
-chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR" "$DATA_DIR"
+mkdir -p "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR"
+chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR" "$DATA_DIR" "$LOG_DIR"
 
 printf "%b\n" "${yellow}Instalando dependências via apk...${reset}"
 apk update
@@ -76,6 +77,7 @@ apk add --no-cache \
   openssl-dev \
   zlib-dev \
   p7zip \
+  openrc \
   logrotate
 
 ### 4. Clonar repositório do Bazarr
@@ -100,23 +102,23 @@ chown -R "$APP_USER:$APP_GROUP" "$INSTALL_DIR" "$DATA_DIR"
 
 printf "%b\n" "${yellow}Criando serviço OpenRC do Bazarr...${reset}"
 
-cat >/etc/init.d/bazarr <<EOF
+cat >/etc/init.d/bazarr <<'EOF'
 #!/sbin/openrc-run
 
 name="Bazarr"
 description="Bazarr Daemon"
 
-command="$INSTALL_DIR/venv/bin/python"
-command_args="$INSTALL_DIR/bazarr.py"
-command_user="$APP_USER:$APP_GROUP"
-directory="$INSTALL_DIR"
-pidfile="/run/\$RC_SVCNAME.pid"
+command="/opt/bazarr/venv/bin/python"
+command_args="/opt/bazarr/bazarr.py"
+command_user="bazarr:media"
+directory="/opt/bazarr"
+pidfile="/run/$RC_SVCNAME.pid"
 command_background="yes"
 
 # Diretório e arquivos de log
-log_dir="/var/log/\$RC_SVCNAME"
-output_log="\${output_log:-\$log_dir/output.log}"
-error_log="\${error_log:-\$log_dir/error.log}"
+log_dir="/var/log/$RC_SVCNAME"
+output_log="${output_log:-$log_dir/output.log}"
+error_log="${error_log:-$log_dir/error.log}"
 
 depend() {
     need net
@@ -125,23 +127,31 @@ depend() {
 
 start_pre() {
     # Garante que o diretório de log exista e seja do usuário correto
-    checkpath --directory --owner "$APP_USER:$APP_GROUP" "\$log_dir"
+    checkpath --directory --owner bazarr:media "$log_dir"
 }
 EOF
 
 chmod +x /etc/init.d/bazarr
+
+# Garante estrutura básica do OpenRC em LXC
+if [ ! -d /run/openrc ]; then
+  printf "%b\n" "${yellow}Inicializando OpenRC em /run/openrc...${reset}"
+  mkdir -p /run/openrc
+  touch /run/openrc/softlevel
+fi
+
 rc-update add bazarr default
 
 ### 7. Configurar logrotate para /var/log/bazarr
 
-cat >/etc/logrotate.d/bazarr <<EOF
+cat >/etc/logrotate.d/bazarr <<'EOF'
 /var/log/bazarr/*.log {
     daily
     rotate 14
     compress
     missingok
     notifempty
-    create 0640 $APP_USER $APP_GROUP
+    create 0640 bazarr media
     sharedscripts
 }
 EOF
@@ -155,7 +165,7 @@ sleep 3
 ### 9. Verificar status e mostrar URL
 
 if rc-service bazarr status >/dev/null 2>&1; then
-  ip_local="$(ip addr show | awk '/inet / && \$2 !~ /^127\./ {sub(/\/.*/,"",\$2); print \$2; exit}')"
+  ip_local="$(ip addr show | awk '/inet / && $2 !~ /^127\./ {sub(/\/.*/,"",$2); print $2; exit}')"
   printf "%b\n" "${green}Bazarr está rodando!${reset}"
   if [ -n "$ip_local" ]; then
     printf "Acesse: %bhttp://%s:%s%b\n" "${green}" "$ip_local" "$APP_PORT" "${reset}"
