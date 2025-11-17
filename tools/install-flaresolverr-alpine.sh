@@ -4,10 +4,20 @@
 # - Cria usuário dedicado
 # - Clona/atualiza repositório oficial
 # - Cria venv Python e instala dependências
-# - Configura serviço OpenRC
+# - Configura serviço OpenRC com logs em /var/log/flaresolverr
 # - Testa API na porta 8191
 
 set -eu
+
+# === Logging centralizado (/var/log/flaresolverr/install.log) ===
+# Requer: tools/logging.sh
+#   #!/bin/sh
+#   set -eu
+#   setup_logging() { ... }
+. "$(dirname "$0")/logging.sh"
+
+SERVICE_NAME="flaresolverr"
+setup_logging "$SERVICE_NAME"
 
 ### ===== CORES =====
 C_RESET="\033[0m"
@@ -46,6 +56,11 @@ if [ "$(id -u)" != "0" ]; then
   exit 1
 fi
 
+if [ ! -f /etc/alpine-release ]; then
+  err "Este instalador é apenas para Alpine Linux."
+  exit 1
+fi
+
 log "Iniciando instalação do FlareSolverr em Alpine..."
 
 ### ===== PACOTES =====
@@ -63,7 +78,8 @@ apk add --no-cache \
   nss \
   ca-certificates \
   curl \
-  openrc
+  openrc \
+  logrotate
 
 ok "Pacotes base instalados."
 
@@ -142,7 +158,6 @@ cat >/usr/local/bin/flaresolverr-run <<'EOF'
 #!/bin/sh
 FLARE_DIR="/opt/flaresolverr"
 FLARE_VENV="${FLARE_DIR}/venv"
-FLARE_LOG_DIR="/var/log/flaresolverr"
 
 export TZ="Europe/Lisbon"
 export PORT="8191"
@@ -153,16 +168,16 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 cd "$FLARE_DIR" || exit 1
 
-# Ativa o venv e roda o Python do venv em foreground (OpenRC usa command_background)
-. "${FLARE_VENV}/bin/activate"
-exec "${FLARE_VENV}/bin/python" src/flaresolverr.py >> "${FLARE_LOG_DIR}/flaresolverr.log" 2>&1
+# Ativa o venv e roda o Python do venv em foreground (OpenRC faz o background)
+. "$FLARE_VENV/bin/activate"
+exec "$FLARE_VENV/bin/python" src/flaresolverr.py
 EOF
 
 chmod +x /usr/local/bin/flaresolverr-run
 
 ok "Wrapper criado."
 
-### ===== SERVIÇO OPENRC =====
+### ===== SERVIÇO OPENRC (com logs em /var/log/flaresolverr) =====
 log "Configurando serviço OpenRC /etc/init.d/flaresolverr..."
 
 cat >/etc/init.d/flaresolverr <<'EOF'
@@ -173,12 +188,22 @@ description="FlareSolverr - proxy para bypass Cloudflare"
 
 command="/usr/local/bin/flaresolverr-run"
 command_user="flaresolverr:flaresolverr"
-command_background=yes
-pidfile="/run/flaresolverr.pid"
+command_background="yes"
+pidfile="/run/$RC_SVCNAME.pid"
+
+# Diretório e arquivos de log
+log_dir="/var/log/$RC_SVCNAME"
+output_log="${output_log:-$log_dir/output.log}"
+error_log="${error_log:-$log_dir/error.log}"
 
 depend() {
   need net
   use dns logger
+}
+
+start_pre() {
+  # Garante que o diretório de log exista e seja do usuário correto
+  checkpath --directory --owner flaresolverr:flaresolverr "$log_dir"
 }
 EOF
 
@@ -195,6 +220,21 @@ rc-update add flaresolverr default || true
 
 ok "Serviço OpenRC configurado."
 
+### ===== LOGROTATE =====
+log "Configurando logrotate para /var/log/flaresolverr..."
+
+cat >/etc/logrotate.d/flaresolverr <<'EOF'
+/var/log/flaresolverr/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0640 flaresolverr flaresolverr
+    sharedscripts
+}
+EOF
+
 ### ===== SUBIR SERVIÇO =====
 log "Subindo serviço FlareSolverr..."
 
@@ -205,8 +245,6 @@ pkill -f flaresolverr-run 2>/dev/null || true
 rc-service flaresolverr restart || warn "rc-service retornou erro, verificando logs..."
 
 sleep 5
-
-rc_service_status=$(rc-service flaresolverr status || true || echo "falhou")
 
 log "Status do serviço:"
 rc-service flaresolverr status || true
@@ -226,19 +264,19 @@ set -e
 
 if [ "${CURL_RC}" -ne 0 ]; then
   warn "curl não conseguiu conectar em 127.0.0.1:8191 (código ${CURL_RC})."
-  warn "Verifique logs em ${FLARE_LOG_DIR}/flaresolverr.log."
+  warn "Verifique logs em ${FLARE_LOG_DIR}."
 elif [ "${HTTP_CODE}" != "200" ]; then
   warn "FlareSolverr respondeu HTTP ${HTTP_CODE}. Resposta salva em ${TEST_FILE}."
 else
   if grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' "${TEST_FILE}"; then
     ok "FlareSolverr respondeu com status \"ok\". Instalação validada!"
   else
-    warn "HTTP 200, mas sem \"status\":\"ok\". Veja ${TEST_FILE} e ${FLARE_LOG_DIR}/flaresolverr.log."
+    warn "HTTP 200, mas sem \"status\":\"ok\". Veja ${TEST_FILE} e ${FLARE_LOG_DIR}."
   fi
 fi
 
 printf "%b\n" "${C_GREEN}FlareSolverr deve estar ouvindo em http://SEU_IP_LXC:8191/v1 (API, sem interface web).${C_RESET}"
-printf "%b\n" "${C_YELLOW}Exemplo de teste a partir de outro host:${C_RESET}"
-printf "%b\n" "curl -L -X POST 'http://SEU_IP_LXC:8191/v1' \\"
-printf "%b\n" "  -H 'Content-Type: application/json' \\"
-printf "%b\n" "  --data-raw '{\"cmd\":\"request.get\",\"url\":\"http://www.google.com\",\"maxTimeout\":60000}'"
+printf "%b\n" "${C_YELLOW}Exemplo de teste a partir de outro host:${C_RESET}\n"
+printf "%s\n" "curl -L -X POST 'http://SEU_IP_LXC:8191/v1' \\"
+printf "%s\n" "  -H 'Content-Type: application/json' \\"
+printf "%s\n" "  --data-raw '{\"cmd\":\"request.get\",\"url\":\"http://www.google.com\",\"maxTimeout\":60000}'"
