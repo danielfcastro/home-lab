@@ -242,5 +242,3 @@ printf "%b\n" "${C_YELLOW}Exemplo de teste a partir de outro host:${C_RESET}"
 printf "%b\n" "curl -L -X POST 'http://SEU_IP_LXC:8191/v1' \\"
 printf "%b\n" "  -H 'Content-Type: application/json' \\"
 printf "%b\n" "  --data-raw '{\"cmd\":\"request.get\",\"url\":\"http://www.google.com\",\"maxTimeout\":60000}'"
-family-arr:~# 
-
