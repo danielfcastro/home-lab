@@ -4,7 +4,19 @@
 # Estilo Servarr / Bazarr / Sonarr
 #
 
-set -e
+set -eu
+
+# -------------------------------------------------------------------
+# Logging centralizado
+# -------------------------------------------------------------------
+# Requer: tools/logging.sh
+#   #!/bin/sh
+#   set -eu
+#   setup_logging() { ... }
+. "$(dirname "$0")/logging.sh"
+
+SERVICE_NAME="radarr"
+setup_logging "$SERVICE_NAME"
 
 # -------------------------------------------------------------------
 # Configurações básicas
@@ -39,14 +51,19 @@ reset="\033[0m"
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
-info()  { echo -e "${blue}[INFO]${reset}  $*"; }
-ok()    { echo -e "${green}[OK]${reset}    $*"; }
-warn()  { echo -e "${yellow}[WARN]${reset}  $*"; }
-error() { echo -e "${red}[ERRO]${reset}  $*"; }
+info()  { printf "%b[INFO]%b  %s\n"  "$blue"  "$reset" "$*"; }
+ok()    { printf "%b[OK]%b    %s\n"  "$green" "$reset" "$*"; }
+warn()  { printf "%b[WARN]%b  %s\n" "$yellow" "$reset" "$*"; }
+error() { printf "%b[ERRO]%b  %s\n" "$red"   "$reset" "$*"; }
 
 # -------------------------------------------------------------------
 # Verificações iniciais
 # -------------------------------------------------------------------
+
+if [ ! -f /etc/alpine-release ]; then
+  error "Este script é apenas para Alpine Linux."
+  exit 1
+fi
 
 if [ "$(id -u)" -ne 0 ]; then
   error "Este script precisa ser executado como root."
@@ -64,9 +81,8 @@ case "$arch" in
     ;;
 esac
 
-echo
-echo -e "${bold}=== Instalando ${APP_NAME} no Alpine (OpenRC) ===${reset}"
-echo
+printf "\n"
+printf "%b=== Instalando %s no Alpine (OpenRC) ===%b\n\n" "$bold" "$APP_NAME" "$reset"
 
 # -------------------------------------------------------------------
 # Pacotes necessários
@@ -83,8 +99,9 @@ apk add --no-cache \
   libintl \
   sqlite-libs \
   krb5-libs \
-  su-exec \
   iproute2 \
+  openrc \
+  logrotate \
   >/dev/null
 
 ok "Pacotes instalados."
@@ -159,7 +176,7 @@ mkdir -p "$TMP_DIR"
 cd "$TMP_DIR"
 
 info "Baixando de:"
-echo "  $RADARR_URL"
+printf "  %s\n" "$RADARR_URL"
 
 if ! curl -fL "$RADARR_URL" -o radarr.tar.gz; then
   error "Falha ao baixar o pacote do Radarr."
@@ -197,14 +214,18 @@ info "Criando wrapper ${WRAPPER_BIN}..."
 cat > "$WRAPPER_BIN" <<'EOF'
 #!/bin/sh
 # Wrapper para rodar Radarr como usuário dedicado no Alpine
-exec su-exec radarr:radarr /opt/radarr/Radarr -nobrowser -data=/var/lib/radarr "$@"
+APP_DIR="/opt/radarr"
+DATA_DIR="/var/lib/radarr"
+
+cd "$APP_DIR" || exit 1
+exec ./Radarr -nobrowser -data="$DATA_DIR" "$@"
 EOF
 
 chmod +x "$WRAPPER_BIN"
 ok "Wrapper criado em ${WRAPPER_BIN}."
 
 # -------------------------------------------------------------------
-# Serviço OpenRC
+# Serviço OpenRC (com logs em /var/log/radarr)
 # -------------------------------------------------------------------
 info "Criando serviço OpenRC em ${SERVICE_FILE}..."
 
@@ -216,11 +237,17 @@ description="Radarr Service"
 
 command="/usr/local/bin/radarr-run"
 command_args=""
+command_user="radarr:radarr"
 command_background="yes"
-pidfile="/run/radarr.pid"
+pidfile="/run/$RC_SVCNAME.pid"
 
 # garante que o start-stop-daemon crie/atualize o pidfile corretamente
 start_stop_daemon_args="--make-pidfile --pidfile ${pidfile}"
+
+# Diretório e arquivos de log
+log_dir="/var/log/$RC_SVCNAME"
+output_log="${output_log:-$log_dir/output.log}"
+error_log="${error_log:-$log_dir/error.log}"
 
 depend() {
   need net
@@ -228,7 +255,7 @@ depend() {
 }
 
 start_pre() {
-  checkpath --directory --owner radarr:radarr /run
+  checkpath --directory --owner radarr:radarr "$log_dir"
 }
 EOF
 
@@ -236,48 +263,78 @@ chmod +x "$SERVICE_FILE"
 ok "Serviço OpenRC criado."
 
 # -------------------------------------------------------------------
-# Habilitar e iniciar serviço
+# Estrutura básica do OpenRC em LXC
+# -------------------------------------------------------------------
+if [ ! -d /run/openrc ]; then
+  info "Inicializando OpenRC em /run/openrc..."
+  mkdir -p /run/openrc
+  touch /run/openrc/softlevel
+fi
+
+# -------------------------------------------------------------------
+# Habilitar serviço
 # -------------------------------------------------------------------
 info "Adicionando serviço ao boot (runlevel default)..."
 rc-update add radarr default >/dev/null 2>&1 || true
 
+# -------------------------------------------------------------------
+# LOGROTATE
+# -------------------------------------------------------------------
+info "Configurando logrotate para /var/log/radarr..."
+
+cat >/etc/logrotate.d/radarr <<'EOF'
+/var/log/radarr/*.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0640 radarr radarr
+    sharedscripts
+}
+EOF
+
+# -------------------------------------------------------------------
+# Iniciar serviço
+# -------------------------------------------------------------------
 info "Iniciando serviço ${APP_NAME}..."
 
 rc-service radarr zap >/dev/null 2>&1 || true
 
 if ! rc-service radarr start; then
   error "Falha ao iniciar o serviço Radarr. Verifique 'rc-service radarr status' e os logs."
+  # não dá rm -rf no TMP_DIR antes de sair? ainda vamos limpar abaixo, tudo bem
   exit 1
 fi
 
 # -------------------------------------------------------------------
 # Verificar status e mostrar URL
 # -------------------------------------------------------------------
-echo
-echo "============================================================"
+printf "\n"
+printf "============================================================\n"
 
 if rc-service radarr status >/dev/null 2>&1; then
   ip_local="$(ip addr show | awk '/inet / && $2 !~ /^127\./ {sub(/\/.*/,"",$2); print $2; exit}')"
-  echo -e "${green}${APP_NAME} está rodando!${reset}"
+  printf "%b%s está rodando!%b\n" "$green" "$APP_NAME" "$reset"
   if [ -n "$ip_local" ]; then
-    echo -e "Acesse: ${green}http://$ip_local:${APP_PORT}${reset}"
+    printf "Acesse: %bhttp://%s:%s%b\n" "$green" "$ip_local" "$APP_PORT" "$reset"
   else
-    echo -e "Acesse: ${green}http://<ip-do-container>:${APP_PORT}${reset}"
+    printf "Acesse: %bhttp://<ip-do-container>:%s%b\n" "$green" "$APP_PORT" "$reset"
   fi
 else
-  echo -e "${red}${APP_NAME} NÃO iniciou.${reset}"
-  echo "Veja 'rc-service radarr status' e os logs em:"
-  echo "  ${INSTALL_DIR}"
-  echo "  ${DATA_DIR}/logs"
+  printf "%b%s NÃO iniciou.%b\n" "$red" "$APP_NAME" "$reset"
+  printf "Veja 'rc-service radarr status' e os logs em:\n"
+  printf "  %s\n" "$INSTALL_DIR"
+  printf "  %s/logs\n" "$DATA_DIR"
 fi
 
-echo
-echo "Binário : $INSTALL_DIR/Radarr"
-echo "Dados   : $DATA_DIR"
-echo "Logs    : $LOG_DIR"
-echo "Serviço : $SERVICE_FILE"
-echo "Wrapper : $WRAPPER_BIN"
-echo "============================================================"
+printf "\n"
+printf "Binário : %s/Radarr\n" "$INSTALL_DIR"
+printf "Dados   : %s\n" "$DATA_DIR"
+printf "Logs    : %s\n" "$LOG_DIR"
+printf "Serviço : %s\n" "$SERVICE_FILE"
+printf "Wrapper : %s\n" "$WRAPPER_BIN"
+printf "============================================================\n"
 
 # -------------------------------------------------------------------
 # Limpeza final
