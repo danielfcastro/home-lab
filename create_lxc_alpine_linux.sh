@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Cria um LXC Alpine no Proxmox com:
+# - IP estático
 # - SSH habilitado (root login permitido)
 # - nano
 # - netstat -putona (net-tools)
@@ -10,28 +11,15 @@
 set -euo pipefail
 
 # ==============================
-# CONFIGURAÇÕES PADRÃO
+# CONFIGURAÇÕES FIXAS
 # ==============================
 
-CTID_DEFAULT=200          # ID padrão do CT
-HOSTNAME_DEFAULT="alpine-lxc"
-STORAGE_DEFAULT="local-lvm"
-DISK_SIZE_DEFAULT="8"     # GiB
-
-CORES_DEFAULT=2
-MEMORY_DEFAULT=1024       # MiB
-SWAP_DEFAULT=512          # MiB
-
-# Ajuste esse template de acordo com 'pveam available | grep alpine'
-TEMPLATE_DEFAULT="alpine-3.20-default_20240606_amd64.tar.zst"
-
-NET_DEFAULT="name=eth0,bridge=vmbr0,ip=dhcp"
-
-# Troque essa senha depois de criar o container!
-ROOT_PASSWORD_DEFAULT="changeme"
+STORAGE="local-lvm"
+TEMPLATE="alpine-3.22-default_20250617_amd64.tar.xz"
+BRIDGE="vmbr0"
 
 # ==============================
-# CORES
+# CORES / LOG
 # ==============================
 
 c_reset="\033[0m"
@@ -47,20 +35,118 @@ log_error() { echo -e "${c_red}[ERRO]${c_reset}  $*" >&2; }
 log_ok()    { echo -e "${c_green}[OK]${c_reset}    $*"; }
 
 # ==============================
-# PARÂMETROS
+# HELP / USO
 # ==============================
 
-CTID="${1:-$CTID_DEFAULT}"
-HOSTNAME="${2:-$HOSTNAME_DEFAULT}"
+show_help() {
+  cat <<EOF
+Uso:
+  $(basename "$0") \\
+    --ctid NUM             \\
+    --ip IP/MASK           \\
+    --gw GATEWAY           \\
+    --disk DISK_SIZE_GB    \\
+    --hostname NOME        \\
+    --root-password SENHA  \\
+    --cores NUM            \\
+    --swap SWAP_MB         \\
+    --memory MEMORY_MB
 
-STORAGE="${STORAGE_DEFAULT}"
-DISK_SIZE="${DISK_SIZE_DEFAULT}"
-CORES="${CORES_DEFAULT}"
-MEMORY="${MEMORY_DEFAULT}"
-SWAP="${SWAP_DEFAULT}"
-TEMPLATE="${TEMPLATE_DEFAULT}"
-NET="${NET_DEFAULT}"
-ROOT_PASSWORD="${ROOT_PASSWORD_DEFAULT}"
+Parâmetros (obrigatórios):
+  --ctid           ID numérico do container (ex: 210)
+  --ip             IP com máscara em notação CIDR (ex: 192.168.100.50/24)
+  --gw             Gateway padrão (ex: 192.168.100.1)
+  --disk           Tamanho do disco em GiB (ex: 8)
+  --hostname       Nome do host dentro do LXC (ex: alpine-tools)
+  --root-password  Senha do usuário root no LXC
+  --cores          Número de vCPUs (ex: 2)
+  --swap           Tamanho de swap em MiB (ex: 512)
+  --memory         Tamanho de RAM em MiB (ex: 1024)
+
+Exemplo:
+  $(basename "$0") \\
+    --ctid 210 \\
+    --ip 192.168.100.50/24 \\
+    --gw 192.168.100.1 \\
+    --disk 8 \\
+    --hostname alpine-tools \\
+    --root-password MinhaSenhaSup3rF0rt3 \\
+    --cores 2 \\
+    --swap 512 \\
+    --memory 1024
+
+EOF
+}
+
+# Se não tiver argumentos, mostra help
+if [ "$#" -eq 0 ]; then
+  show_help
+  exit 1
+fi
+
+# ==============================
+# PARSE DE PARÂMETROS
+# ==============================
+
+CTID=""
+IP_MASK=""
+GATEWAY=""
+DISK_SIZE=""
+HOSTNAME=""
+ROOT_PASSWORD=""
+CORES=""
+SWAP=""
+MEMORY=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ctid)
+      CTID="$2"; shift 2 ;;
+    --ip)
+      IP_MASK="$2"; shift 2 ;;
+    --gw)
+      GATEWAY="$2"; shift 2 ;;
+    --disk)
+      DISK_SIZE="$2"; shift 2 ;;
+    --hostname)
+      HOSTNAME="$2"; shift 2 ;;
+    --root-password)
+      ROOT_PASSWORD="$2"; shift 2 ;;
+    --cores)
+      CORES="$2"; shift 2 ;;
+    --swap)
+      SWAP="$2"; shift 2 ;;
+    --memory)
+      MEMORY="$2"; shift 2 ;;
+    --help|-h)
+      show_help; exit 0 ;;
+    *)
+      log_error "Parâmetro desconhecido: $1"
+      show_help
+      exit 1 ;;
+  esac
+done
+
+# Validação básica
+MISSING=""
+[ -z "$CTID" ]          && MISSING="${MISSING} --ctid"
+[ -z "$IP_MASK" ]       && MISSING="${MISSING} --ip"
+[ -z "$GATEWAY" ]       && MISSING="${MISSING} --gw"
+[ -z "$DISK_SIZE" ]     && MISSING="${MISSING} --disk"
+[ -z "$HOSTNAME" ]      && MISSING="${MISSING} --hostname"
+[ -z "$ROOT_PASSWORD" ] && MISSING="${MISSING} --root-password"
+[ -z "$CORES" ]         && MISSING="${MISSING} --cores"
+[ -z "$SWAP" ]          && MISSING="${MISSING} --swap"
+[ -z "$MEMORY" ]        && MISSING="${MISSING} --memory"
+
+if [ -n "$MISSING" ]; then
+  log_error "Parâmetros obrigatórios faltando:${MISSING}"
+  echo
+  show_help
+  exit 1
+fi
+
+NET="name=eth0,bridge=${BRIDGE},ip=${IP_MASK},gw=${GATEWAY}"
 
 # ==============================
 # CHECKS
@@ -87,7 +173,6 @@ if ! pveam available | grep -q "$TEMPLATE"; then
   log_info "Template $TEMPLATE não encontrado. Baixando para 'local'..."
   pveam download local "$TEMPLATE" || {
     log_error "Não consegui baixar o template $TEMPLATE."
-    log_error "Rode: pveam available | grep alpine e ajuste TEMPLATE_DEFAULT no script."
     exit 1
   }
 else
@@ -125,12 +210,6 @@ log_ok "Container $CTID iniciado."
 # ==============================
 # PACOTES INTERNOS
 # ==============================
-# Aqui garantimos:
-# - nano
-# - openssh (servidor SSH)
-# - net-tools (netstat, ifconfig)
-# - procps-ng (ps aux completo)
-# - figlet (pro banner)
 
 log_info "Instalando pacotes (nano, openssh, net-tools, procps-ng, figlet)..."
 
@@ -149,10 +228,10 @@ log_info "Configurando sshd para permitir root login e subir no boot..."
 
 # Permitir root login
 pct exec "$CTID" -- ash -c "
-  if ! grep -q '^PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null; then
-    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+  if grep -q '^#\?PermitRootLogin' /etc/ssh/sshd_config 2>/dev/null; then
+    sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
   else
-    sed -i 's/^PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
   fi
 "
 
@@ -168,47 +247,41 @@ log_ok "SSH configurado (root login permitido, serviço no boot)."
 # ==============================
 # BANNER SSH (banner.txt)
 # ==============================
-# Banner apresentado AO CONECTAR via SSH (antes do login).
-# Arquivo: /etc/ssh/banner.txt
-# Config: Banner /etc/ssh/banner.txt em sshd_config
 
 log_info "Configurando banner.txt para login SSH..."
 
 pct exec "$CTID" -- ash -c '
-  HOSTNAME_CUR=$(hostname)
-
-  cat > /etc/ssh/banner.txt <<EOF
-
-$(figlet "$HOSTNAME_CUR" 2>/dev/null || echo "*** $HOSTNAME_CUR ***")
-
-Bem-vindo ao LXC Alpine do HomeLab!
-
-Host........: $HOSTNAME_CUR
-Kernel......: $(uname -r)
-Data/horário: $(date)
-
-Ferramentas úteis disponíveis:
-  - nano
-  - netstat -putona
-  - ifconfig
-  - ps aux
-
-ATENÇÃO: Troque a senha do root com o comando:  passwd
-
-EOF
+  HOST=$(hostname)
+  {
+    echo
+    figlet "$HOST" 2>/dev/null || echo "### $HOST ###"
+    echo
+    echo "Bem-vindo ao LXC Alpine do HomeLab!"
+    echo
+    echo "Host........: $HOST"
+    echo "Kernel......: $(uname -r)"
+    echo "Data/Hora...: $(date)"
+    echo
+    echo "Ferramentas disponíveis:"
+    echo "  - nano"
+    echo "  - netstat -putona"
+    echo "  - ifconfig"
+    echo "  - ps aux"
+    echo
+    echo "ATENÇÃO: troque a senha do root com:  passwd"
+    echo
+  } > /etc/ssh/banner.txt
 '
 
 # Ativar o uso de Banner no sshd_config
 pct exec "$CTID" -- ash -c "
-  if ! grep -q '^Banner ' /etc/ssh/sshd_config 2>/dev/null; then
-    echo 'Banner /etc/ssh/banner.txt' >> /etc/ssh/sshd_config
-  else
+  if grep -q '^Banner ' /etc/ssh/sshd_config 2>/dev/null; then
     sed -i 's|^Banner .*|Banner /etc/ssh/banner.txt|' /etc/ssh/sshd_config
+  else
+    echo 'Banner /etc/ssh/banner.txt' >> /etc/ssh/sshd_config
   fi
+  rc-service sshd restart
 "
-
-# Reiniciar sshd pra aplicar Banner
-pct exec "$CTID" -- rc-service sshd restart
 
 log_ok "banner.txt configurado e ativo no SSH."
 
@@ -216,7 +289,7 @@ log_ok "banner.txt configurado e ativo no SSH."
 # RESUMO
 # ==============================
 
-IP_INFO=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | awk "/inet / {print \$2}" || true)
+IP_INFO=$(pct exec "$CTID" -- ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}' || true)
 
 echo
 echo -e "${c_magenta}=============================================${c_reset}"
@@ -225,6 +298,7 @@ echo -e "  CTID:       ${c_cyan}$CTID${c_reset}"
 echo -e "  Hostname:   ${c_cyan}$HOSTNAME${c_reset}"
 echo -e "  Rootfs:     ${c_cyan}${STORAGE}:${DISK_SIZE}G${c_reset}"
 echo -e "  CPU/Mem:    ${c_cyan}${CORES} vCPU / ${MEMORY} MiB RAM${c_reset}"
+echo -e "  Swap:       ${c_cyan}${SWAP} MiB${c_reset}"
 echo -e "  Rede:       ${c_cyan}$NET${c_reset}"
 if [ -n "$IP_INFO" ]; then
   echo -e "  IP (eth0):  ${c_cyan}$IP_INFO${c_reset}"
