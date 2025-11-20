@@ -22,6 +22,9 @@ DATA_DIR="/var/lib/qbittorrent"
 LOG_DIR="/var/log/qbittorrent"
 WEB_PORT="8080"
 
+# Hash PBKDF2 correspondente à senha 'adminadmin'
+QBIT_PBKDF2_HASH='@ByteArray(ARQ77eY1NUZaQsuDHbIMCA==:0WMRkYTUWVT9wVvdDtHAjU9b3b7uB8NR1Gur2hmQCvCDpm39Q+PsJRJPaCU51dEiz+dTzh8qbPsL8WkFljQYFQ==)'
+
 green="\033[1;32m"
 yellow="\033[1;33m"
 red="\033[1;31m"
@@ -58,6 +61,47 @@ fi
 printf "%b\n" "${yellow}==> Criando diretórios de dados e logs...${reset}"
 mkdir -p "$DATA_DIR" "$LOG_DIR"
 chown -R "$APP_USER:$APP_GROUP" "$DATA_DIR" "$LOG_DIR"
+
+# ============================================================
+# Configuração do WebUI (admin / adminadmin)
+# ============================================================
+printf "%b\n" "${yellow}==> Ajustando configuração do WebUI (admin / adminadmin)...${reset}"
+
+CONFIG_DIR="${DATA_DIR}/.config/qBittorrent"
+CONFIG_FILE="${CONFIG_DIR}/qBittorrent.conf"
+
+mkdir -p "$CONFIG_DIR"
+chown -R "$APP_USER:$APP_GROUP" "$CONFIG_DIR"
+
+if [ -f "$CONFIG_FILE" ]; then
+  # Remove credenciais antigas
+  sed -i '/^WebUI\\Username=/d' "$CONFIG_FILE" || true
+  sed -i '/^WebUI\\Password_/d' "$CONFIG_FILE" || true
+
+  # Garante seção Preferences\WebUI
+  if ! grep -q '^\[Preferences\\WebUI\]' "$CONFIG_FILE"; then
+    printf '\n[Preferences\\WebUI]\n' >>"$CONFIG_FILE"
+  fi
+
+  # Acrescenta usuário e senha
+  {
+    printf 'WebUI\\Enabled=true\n'
+    printf 'WebUI\\Port=%s\n' "$WEB_PORT"
+    printf 'WebUI\\Username=admin\n'
+    printf 'WebUI\\Password_PBKDF2="%s"\n' "$QBIT_PBKDF2_HASH"
+  } >>"$CONFIG_FILE"
+else
+  # Cria config mínimo já com WebUI habilitado e senha configurada
+  cat >"$CONFIG_FILE" <<EOF
+[Preferences\\WebUI]
+WebUI\\Enabled=true
+WebUI\\Port=${WEB_PORT}
+WebUI\\Username=admin
+WebUI\\Password_PBKDF2="${QBIT_PBKDF2_HASH}"
+EOF
+fi
+
+chown "$APP_USER:$APP_GROUP" "$CONFIG_FILE"
 
 # Ajusta /etc/conf.d/qbittorrent-nox para usar usuário, profile e logs em /var/log/qbittorrent
 CONF_FILE="/etc/conf.d/qbittorrent-nox"
@@ -151,7 +195,7 @@ else
   printf "%b\n" "${red}O serviço ${SERVICE_NAME} NÃO parece estar rodando.${reset}"
   printf "%b\n" "Verifique com:"
   printf "  %brc-service %s status%b\n" "${yellow}" "$SERVICE_NAME" "${reset}"
-  printf "%b\n" "Logs em: %b%s%b ou /var/log/messages" "${reset}" "${yellow}" "$LOG_DIR" "${reset}"
+  printf "%b\n" "Logs em: %b%s%b ou /var/log/messages\n" "${reset}" "${yellow}" "$LOG_DIR" "${reset}"
 fi
 
 printf "\n"
